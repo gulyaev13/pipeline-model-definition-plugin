@@ -46,13 +46,11 @@ import org.kohsuke.stapler.DataBoundSetter;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Phaser;
 
 import static org.junit.Assert.*;
 
 public class TriggersTest extends AbstractModelDefTest {
-
-    private static CountDownLatch triggerLatch;
 
     @Test
     public void simpleTriggers() throws Exception {
@@ -179,58 +177,112 @@ public class TriggersTest extends AbstractModelDefTest {
     @LocalData
     @Test
     public void doNotRestartEqualTriggers() throws Exception {
-        // Create countdown latch to monitor how many times
-        // a trigger has been restarted.
-        triggerLatch = new CountDownLatch(2);
 
         // Create the first build. The DeclarativeJobPropertyTrackerAction action will be created.
         WorkflowRun b = getAndStartNonRepoBuild("simplePipelineWithTestTrigger");
         j.assertBuildStatusSuccess(j.waitForCompletion(b));
 
-        System.out.println("after build " + b.getId() + ": " + triggerLatch.getCount());
+        // get trigger from job
+        WorkflowJob job = b.getParent();
+        PipelineTriggersJobProperty triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        TestTrigger myTrigger1 = (TestTrigger)triggersJobProperty.getTriggers().get(0);
+
+        System.out.println("after build " + b.getId() + ": myTrigger1 starts(): " + myTrigger1.getPhaser().getPhase());
 
         // Since the tracker action was not previously available,
-        // the trigger will get restarted and the latch will be decremented
-        assertTrue(triggerLatch.getCount() == 1);
-
-        WorkflowJob job = b.getParent();
+        // the trigger will get restarted and the phaser will be incremented
+        assertTrue(myTrigger1.getPhaser().getPhase() == 1);
+        assertTrue(myTrigger1.isStarted);
 
         // Build it again.
         b = j.buildAndAssertSuccess(job);
-        System.out.println("after build " + b.getId() + ": " + triggerLatch.getCount());
+        triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        myTrigger1 = (TestTrigger)triggersJobProperty.getTriggers().get(0);
+        System.out.println("after build " + b.getId() + ": myTrigger1 starts(): " + myTrigger1.getPhaser().getPhase());
 
         // Since the trigger is the same (the config was not changed between builds),
         // it will not get restarted,
-        // and the latch will NOT be decremented.
-        assertTrue(triggerLatch.getCount() == 1);
+        // and the phaser will NOT be incremented.
+        assertTrue(myTrigger1.getPhaser().getPhase() == 1);
+        assertTrue(myTrigger1.isStarted);
 
         // Let simulate someone changing the trigger config
-        PipelineTriggersJobProperty triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
-        List<Trigger> newTriggers = new ArrayList<>();
+        triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        job.removeProperty(triggersJobProperty);
+
+        List newTriggers = new ArrayList<>();
         TestTrigger myTrigger2 = new TestTrigger();
         myTrigger2.setName("myTrigger2");
         newTriggers.add(myTrigger2);
-        job.removeProperty(triggersJobProperty);
         job.addProperty(new PipelineTriggersJobProperty(newTriggers));
 
         // Build it again with a new trigger config
         b = j.buildAndAssertSuccess(job);
-        System.out.println("after build " + b.getId() + ": " + triggerLatch.getCount());
+        triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        List<Trigger<?>> triggerList = triggersJobProperty.getTriggers();
+        for (Trigger t: triggerList) {
+            TestTrigger testT = (TestTrigger)t;
+            String name = testT.name;
+            if (name.equals("myTrigger1")) {
+                // myTrigger1 is being removed. it will NOT be restarted.
+                System.out.println("after build " + b.getId() + ": myTrigger1 starts(): " + testT.getPhaser().getPhase());
+                assertTrue(testT.getPhaser().getPhase() == 1);
+                // it should have been stopped!
+                assertFalse(testT.isStarted);
+            }
+            if (name.equals("myTrigger2")) {
+                // myTrigger2 is being added. it will be restarted.
+                System.out.println("after build " + b.getId() + ": myTrigger2 starts(): " + testT.getPhaser().getPhase());
+                assertTrue(testT.getPhaser().getPhase() == 1);
+                assertTrue(testT.isStarted);
+            }
+        }
 
-        // Since the trigger is now different (the config WAS changed between builds),
-        // it should get restarted,
-        // and the latch WILL be decremented.
-        assertTrue(triggerLatch.getCount() == 0);
+        // Let simulate someone adding a new trigger
+        triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        List triggers = triggersJobProperty.getTriggers();
+        TestTrigger myOtherTrigger = new TestTrigger();
+        myOtherTrigger.setName("myOtherTrigger");
+        triggers.add(myOtherTrigger);
+        job.removeProperty(triggersJobProperty);
+        job.addProperty(new PipelineTriggersJobProperty(triggers));
 
+        // Build it again with a new trigger config
+        b = j.buildAndAssertSuccess(job);
+        triggersJobProperty = job.getProperty(PipelineTriggersJobProperty.class);
+        triggerList = triggersJobProperty.getTriggers();
+        for (Trigger t: triggerList) {
+            TestTrigger testT = (TestTrigger)t;
+            String name = testT.name;
+            if (name.equals("myOtherTrigger")) {
+                // myOtherTrigger has been added. it will get restarted
+                System.out.println("after build " + b.getId() + ": myOtherTrigger starts(): " + testT.getPhaser().getPhase());
+                // should be 1
+                assertTrue(testT.getPhaser().getPhase() == 1);
+                assertTrue(testT.isStarted);
+            }
+            if (name.equals("myTrigger2")) {
+                // myTrigger2 is being added. it will be restarted.
+                System.out.println("after build " + b.getId() + ": myTrigger2 starts(): " + testT.getPhaser().getPhase());
+                assertTrue(testT.getPhaser().getPhase() == 1);
+                assertTrue(testT.isStarted);
+            }
+        }
     }
 
     @TestExtension("doNotRestartEqualTriggers")
     public static class TestTrigger extends Trigger {
 
-        private String name;
+        protected String name;
+        protected boolean isStarted = false;
+        private transient Phaser phaser;
 
         public String getName() {
             return name;
+        }
+
+        public Phaser getPhaser() {
+            return phaser;
         }
 
         @DataBoundSetter
@@ -240,19 +292,30 @@ public class TriggersTest extends AbstractModelDefTest {
 
         @DataBoundConstructor
         public TestTrigger() {
+            phaser = new Phaser(1);
         }
 
         @Override
         public void start(Item project, boolean newInstance) {
             super.start(project, newInstance);
             System.out.println("Calling START() for " + name);
+            phaser.arrive();
+            synchronized (this) {
+                isStarted = true;
+            }
+        }
+
+        public boolean isStarted() {
+            return isStarted;
         }
 
         @Override
         public void stop() {
             super.stop();
             System.out.println("Calling STOP() for " + name);
-            triggerLatch.countDown();
+            synchronized (this) {
+                isStarted = false;
+            }
         }
 
         @Override
@@ -268,9 +331,6 @@ public class TriggersTest extends AbstractModelDefTest {
                 return true;
             }
         }
-
-
     }
-
 
 }
